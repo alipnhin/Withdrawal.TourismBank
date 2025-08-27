@@ -3,29 +3,29 @@
 namespace TPG.SI.TadbirPay.Withdrawal.TourismBank.Dtos.Payment;
 
 /// <summary>
-/// مدل metadata برای مدیریت state پرداخت گروهی
+/// مدل metadata برای مدیریت state پرداخت گروهی - نسخه بازطراحی شده
 /// </summary>
 public class PaymentOrderMetadata
 {
     /// <summary>
-    /// آیا مرحله Execute شروع شده است
+    /// مرحله فعلی پرداخت
     /// </summary>
-    public bool IsExecutionStarted { get; set; } = false;
+    public PaymentPhase CurrentPhase { get; set; } = PaymentPhase.Registered;
 
     /// <summary>
-    /// آیا مرحله Execute با موفقیت انجام شده است
+    /// آخرین وضعیت دریافت شده از بانک
     /// </summary>
-    public bool IsExecutionCompleted { get; set; } = false;
+    public string LastBankStatus { get; set; }
 
     /// <summary>
-    /// تاریخ شروع مرحله Execute
+    /// وضعیت هر تراکنش بر اساس شماره ردیف
     /// </summary>
-    public DateTime? ExecutionStartedAt { get; set; }
+    public Dictionary<int, string> TransactionStatuses { get; set; } = new();
 
     /// <summary>
-    /// تاریخ تکمیل مرحله Execute
+    /// آخرین زمان استعلام از بانک
     /// </summary>
-    public DateTime? ExecutionCompletedAt { get; set; }
+    public DateTime? LastInquiryTime { get; set; }
 
     /// <summary>
     /// تعداد دفعات تلاش برای Execute
@@ -38,14 +38,24 @@ public class PaymentOrderMetadata
     public string LastExecutionError { get; set; }
 
     /// <summary>
-    /// وضعیت آخرین استعلام از بانک
+    /// آیا نیاز به استعلام تفصیلی دارد
     /// </summary>
-    public string LastBankStatus { get; set; }
+    public bool RequiresDetailedInquiry { get; set; } = false;
 
     /// <summary>
-    /// تاریخ آخرین استعلام
+    /// زمان شروع مرحله Execute
     /// </summary>
-    public DateTime? LastInquiryAt { get; set; }
+    public DateTime? ExecutionStartedAt { get; set; }
+
+    /// <summary>
+    /// زمان تکمیل مرحله Execute
+    /// </summary>
+    public DateTime? ExecutionCompletedAt { get; set; }
+
+    /// <summary>
+    /// آیا DoPayment با موفقیت اجرا شده است
+    /// </summary>
+    public bool IsDoPaymentCompleted { get; set; } = false;
 
     /// <summary>
     /// تبدیل به JSON برای ذخیره در PaymentOrderDto.MetaData
@@ -82,13 +92,72 @@ public class PaymentOrderMetadata
     }
 
     /// <summary>
+    /// آیا نیاز به اجرای DoPayment دارد
+    /// </summary>
+    public bool ShouldExecuteDoPayment()
+    {
+        return LastBankStatus?.ToUpper() == "READY" &&
+               !IsDoPaymentCompleted &&
+               ExecutionAttempts < 3;
+    }
+
+    /// <summary>
+    /// آیا باید از استعلام تفصیلی استفاده کند
+    /// </summary>
+    public bool ShouldUseDetailedInquiry()
+    {
+        return IsDoPaymentCompleted ||
+               RequiresDetailedInquiry ||
+               LastBankStatus?.ToUpper() == "DONE" ||
+               CurrentPhase >= PaymentPhase.Executed;
+    }
+
+    /// <summary>
+    /// به‌روزرسانی metadata بر اساس وضعیت بانک
+    /// </summary>
+    public void UpdateFromBankStatus(string bankStatus)
+    {
+        LastBankStatus = bankStatus;
+        LastInquiryTime = DateTime.UtcNow;
+
+        var status = bankStatus?.ToUpper();
+        switch (status)
+        {
+            case "READY":
+                CurrentPhase = PaymentPhase.ReadyForExecution;
+                break;
+            case "DONE":
+                CurrentPhase = PaymentPhase.Executed;
+                RequiresDetailedInquiry = true;
+                break;
+            case "GROUP_PAYMENT_ERROR_STATE":
+            case "FAILED":
+                CurrentPhase = PaymentPhase.Failed;
+                break;
+            case "GROUP_PAYMENT_WAITING_STATE":
+            case "GROUP_PAYMENT_REGISTERED_STATE":
+            case "GROUP_PAYMENT_UPLOADING_STATE":
+                CurrentPhase = PaymentPhase.Processing;
+                break;
+        }
+    }
+
+    /// <summary>
+    /// به‌روزرسانی وضعیت یک تراکنش
+    /// </summary>
+    public void UpdateTransactionStatus(int lineNumber, string status)
+    {
+        TransactionStatuses[lineNumber] = status;
+    }
+
+    /// <summary>
     /// علامت‌گذاری شروع مرحله Execute
     /// </summary>
     public void MarkExecutionStarted()
     {
-        IsExecutionStarted = true;
         ExecutionStartedAt = DateTime.UtcNow;
         ExecutionAttempts++;
+        CurrentPhase = PaymentPhase.Executing;
     }
 
     /// <summary>
@@ -96,9 +165,10 @@ public class PaymentOrderMetadata
     /// </summary>
     public void MarkExecutionCompleted()
     {
-        IsExecutionCompleted = true;
+        IsDoPaymentCompleted = true;
         ExecutionCompletedAt = DateTime.UtcNow;
         LastExecutionError = null;
+        CurrentPhase = PaymentPhase.Executed;
     }
 
     /// <summary>
@@ -108,30 +178,74 @@ public class PaymentOrderMetadata
     {
         LastExecutionError = error;
         ExecutionCompletedAt = DateTime.UtcNow;
+        CurrentPhase = PaymentPhase.Failed;
     }
 
     /// <summary>
-    /// به‌روزرسانی وضعیت استعلام
+    /// آیا تراکنش در حالت نهایی است
     /// </summary>
-    public void UpdateInquiryStatus(string bankStatus)
+    public bool IsInFinalState()
     {
-        LastBankStatus = bankStatus;
-        LastInquiryAt = DateTime.UtcNow;
+        return CurrentPhase == PaymentPhase.Completed ||
+               CurrentPhase == PaymentPhase.Failed;
     }
 
     /// <summary>
-    /// آیا نیاز به Execute دارد
+    /// دریافت توضیح وضعیت فعلی
     /// </summary>
-    public bool NeedsExecution()
+    public string GetCurrentStatusDescription()
     {
-        return !IsExecutionStarted || !IsExecutionCompleted && ExecutionAttempts < 3;
+        return CurrentPhase switch
+        {
+            PaymentPhase.Registered => "ثبت شده در بانک",
+            PaymentPhase.Processing => "در حال پردازش",
+            PaymentPhase.ReadyForExecution => "آماده اجرا",
+            PaymentPhase.Executing => "در حال اجرا",
+            PaymentPhase.Executed => "اجرا شده",
+            PaymentPhase.Completed => "تکمیل شده",
+            PaymentPhase.Failed => "ناموفق",
+            _ => "نامشخص"
+        };
     }
+}
+
+/// <summary>
+/// مراحل مختلف پرداخت گروهی
+/// </summary>
+public enum PaymentPhase
+{
+    /// <summary>
+    /// ثبت اولیه در بانک
+    /// </summary>
+    Registered = 0,
 
     /// <summary>
-    /// آیا باید از سرویس InquiryFromCore استفاده کند
+    /// در حال پردازش در بانک
     /// </summary>
-    public bool ShouldUseInquiryFromCore()
-    {
-        return IsExecutionStarted;
-    }
+    Processing = 1,
+
+    /// <summary>
+    /// آماده اجرای DoPayment
+    /// </summary>
+    ReadyForExecution = 2,
+
+    /// <summary>
+    /// در حال اجرای DoPayment
+    /// </summary>
+    Executing = 3,
+
+    /// <summary>
+    /// DoPayment اجرا شده
+    /// </summary>
+    Executed = 4,
+
+    /// <summary>
+    /// تمام مراحل تکمیل شده
+    /// </summary>
+    Completed = 5,
+
+    /// <summary>
+    /// با خطا مواجه شده
+    /// </summary>
+    Failed = -1
 }
