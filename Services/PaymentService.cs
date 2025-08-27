@@ -90,7 +90,6 @@ internal class PaymentService : IPaymentService
                 };
             }
 
-            // ایجاد DocumentItems برای هر تراکنش
             var documentItems = paymentOrderDto.Transactions
                 .Select(transaction => new DocumentItem
                 {
@@ -106,7 +105,6 @@ internal class PaymentService : IPaymentService
 
             string transactionId = GenerateTransactionId(metaData.OrganizationCode);
 
-            // ایجاد بدنه درخواست
             var requestBody = new GroupPaymentRegisterRequest
             {
                 TransactionId = transactionId,
@@ -119,7 +117,6 @@ internal class PaymentService : IPaymentService
                 DocumentItems = documentItems
             };
 
-            // ارسال درخواست به API و دریافت پاسخ
             var response = await SendRequestAsync<BaseResponse>(
                 ApiEndpoints.GroupPaymentRegister,
                 requestBody,
@@ -138,12 +135,35 @@ internal class PaymentService : IPaymentService
 
             var registerResponse = response.Data;
 
+            if (registerResponse.RsCode == 4456 && registerResponse.ErrorList?.Any() == true)
+            {
+                var result = new RegisterGroupPaymentResult
+                {
+                    IsSuccess = true,
+                    TrackingId = transactionId,
+                    Message = "ثبت تراکنش گروهی با برخی خطاها انجام شد",
+                    ErrorCode = "4456"
+                };
+
+                result.ErrorList = registerResponse.ErrorList
+                    .Select(error => new TransactionRegistrationError
+                    {
+                        Code = error.Code,
+                        Desc = error.Desc,
+                        ParamName = error.ParamName,
+                        ParamPath = error.ParamPath
+                    }).ToList();
+
+                return result;
+            }
+
             if (!registerResponse.IsSuccess)
             {
                 return new RegisterGroupPaymentResult
                 {
                     IsSuccess = false,
-                    Message = $"خطا در ثبت تراکنش: {registerResponse.Message}"
+                    Message = $"خطا در ثبت تراکنش: {registerResponse.Message}",
+                    ErrorCode = registerResponse.RsCode.ToString()
                 };
             }
 
@@ -171,7 +191,6 @@ internal class PaymentService : IPaymentService
             };
         }
     }
-
     /// <summary>
     /// اجرای پرداخت گروهی
     /// </summary>
@@ -586,10 +605,10 @@ internal class PaymentService : IPaymentService
     /// ارسال درخواست به API و پردازش پاسخ
     /// </summary>
     private async Task<ApiResponse<T>> SendRequestAsync<T>(
-        string url,
-        object requestBody,
-        GatewayInfoDto gatewayInfo,
-        string correlationId)
+       string url,
+       object requestBody,
+       GatewayInfoDto gatewayInfo,
+       string correlationId)
     {
         try
         {
@@ -606,7 +625,6 @@ internal class PaymentService : IPaymentService
                 };
             }
 
-            // دریافت توکن دسترسی
             var accessToken = await GetAccessTokenAsync(metaData.ClientId, metaData.ClientSecret, metaData.BranchCode);
             if (!accessToken.IsSuccess)
             {
@@ -618,19 +636,11 @@ internal class PaymentService : IPaymentService
                 };
             }
 
-            // تنظیم هدرهای درخواست
             _httpClient.DefaultRequestHeaders.Clear();
             _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
             string body = JsonSerializer.Serialize(requestBody, _jsonOptions);
-            string signString = $"POST#{url}#{metaData.ApiKey}#{body}";
-            if (url == ApiEndpoints.GroupPaymentRegister)
-            {
-                var requestDto = (GroupPaymentRegisterRequest)requestBody;
-                // httpMethod(Upper Case)#url(after Address Root)#ApiKey# SourceDeposit#TotalCount#TotalAmount
-                signString = $"POST#{url}#{metaData.ApiKey}#{gatewayInfo.AccountNumber}#{requestDto.DocumentItems.Count}#{requestDto.DocumentItems.Sum(x => x.Amount.ParseToLong())}";
-            }
-
+            string signString = GenerateSignatureString(url, metaData.ApiKey, body, requestBody, gatewayInfo);
             string signature = SignData(signString, gatewayInfo.PrivateEncryptionKey);
 
             _httpClient.DefaultRequestHeaders.Add("ApiKey", metaData.ApiKey);
@@ -638,7 +648,6 @@ internal class PaymentService : IPaymentService
             _httpClient.DefaultRequestHeaders.Add("Accept-Version", _options.Value.ApiVersion);
             _httpClient.DefaultRequestHeaders.Add("AccessToken", accessToken.Access_Token);
 
-            // ارسال درخواست به بانک
             var response = await _httpClient.PostAsJsonAsync(endpoint, requestBody).ConfigureAwait(false);
             var responseContent = await response.Content.ReadAsStringAsync();
 
@@ -655,12 +664,11 @@ internal class PaymentService : IPaymentService
                 return new ApiResponse<T>
                 {
                     Success = false,
-                    ErrorMessage = $"خطای سرویس بانک: {failedResponse.Message}, کد خطا:{failedResponse.RsCode}",
+                    ErrorMessage = $"خطای سرویس بانک: {failedResponse?.Message}, کد خطا:{failedResponse?.RsCode}",
                     StatusCode = (int)response.StatusCode
                 };
             }
 
-            // تحلیل پاسخ بانک
             var apiResponse = JsonSerializer.Deserialize<T>(responseContent, _jsonOptions);
             if (apiResponse == null)
             {
@@ -695,6 +703,20 @@ internal class PaymentService : IPaymentService
                 StatusCode = 500
             };
         }
+    }
+
+    private string GenerateSignatureString(string url, string apiKey, string body, object requestBody, GatewayInfoDto gatewayInfo)
+    {
+        if (url == ApiEndpoints.GroupPaymentRegister)
+        {
+            var requestDto = (GroupPaymentRegisterRequest)requestBody;
+            long totalAmount = requestDto.DocumentItems.Sum(x => x.Amount.ParseToLong());
+            int totalCount = requestDto.DocumentItems.Count;
+
+            return $"POST#{url}#{apiKey}#{gatewayInfo.AccountNumber}#{totalCount}#{totalAmount}";
+        }
+
+        return $"POST#{url}#{apiKey}#{body}";
     }
 
     #endregion

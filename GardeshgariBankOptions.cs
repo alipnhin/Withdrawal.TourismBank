@@ -1,7 +1,7 @@
 ﻿namespace TPG.SI.TadbirPay.Withdrawal.TourismBank;
 
 /// <summary>
-/// تنظیمات کامل بانک گردشگری
+/// تنظیمات کامل بانک گردشگری - نسخه بهبود یافته
 /// </summary>
 public class GardeshgariBankOptions
 {
@@ -32,7 +32,7 @@ public class GardeshgariBankOptions
     #region Payment Workflow Configuration
 
     /// <summary>
-    /// حداکثر تعداد تلاش برای Execute
+    /// حداکثر تعداد تلاش برای Execute - فقط برای خطاهای فنی
     /// </summary>
     public int MaxExecutionAttempts { get; set; } = 3;
 
@@ -63,6 +63,97 @@ public class GardeshgariBankOptions
 
     #endregion
 
+    #region Safe Retry Configuration
+
+    /// <summary>
+    /// حداکثر تعداد تلاش برای عملیات استعلام (فقط read-only operations)
+    /// </summary>
+    public int MaxInquiryRetryAttempts { get; set; } = 3;
+
+    /// <summary>
+    /// زمان انتظار بین استعلام‌های ناموفق (ثانیه)
+    /// </summary>
+    public int InquiryRetryDelaySeconds { get; set; } = 5;
+
+    /// <summary>
+    /// کدهای خطای قابل تکرار برای Execute
+    /// </summary>
+    public int[] RetryableExecutionErrorCodes { get; set; } = { 408, 500, 502, 503, 504 };
+
+    /// <summary>
+    /// کدهای خطای قابل تکرار برای Inquiry
+    /// </summary>
+    public int[] RetryableInquiryErrorCodes { get; set; } = { 408, 500, 502, 503, 504, 429 };
+
+    /// <summary>
+    /// حداکثر زمان انتظار برای refresh استعلام (دقیقه)
+    /// </summary>
+    public int InquiryRefreshIntervalMinutes { get; set; } = 5;
+
+    #endregion
+
+    #region Performance Configuration
+
+    /// <summary>
+    /// فعال‌سازی cache برای نتایج استعلام موفق
+    /// </summary>
+    public bool EnableInquiryCache { get; set; } = true;
+
+    /// <summary>
+    /// مدت زمان نگهداری cache استعلام (دقیقه)
+    /// </summary>
+    public int InquiryCacheDurationMinutes { get; set; } = 10;
+
+    /// <summary>
+    /// حداکثر تعداد درخواست همزمان
+    /// </summary>
+    public int MaxConcurrentRequests { get; set; } = 10;
+
+    /// <summary>
+    /// اندازه batch برای استعلام‌های تکی (تعداد تراکنش در هر درخواست)
+    /// </summary>
+    public int BatchInquirySize { get; set; } = 50;
+
+    #endregion
+
+    #region Security Configuration
+
+    /// <summary>
+    /// فعال‌سازی اعتبارسنجی certificate
+    /// </summary>
+    public bool EnableCertificateValidation { get; set; } = true;
+
+    /// <summary>
+    /// فعال‌سازی signature verification
+    /// </summary>
+    public bool EnableSignatureVerification { get; set; } = true;
+
+    /// <summary>
+    /// حداکثر اندازه پاسخ مجاز (بایت)
+    /// </summary>
+    public long MaxResponseSizeBytes { get; set; } = 10_485_760; // 10MB
+
+    #endregion
+
+    #region Monitoring Configuration
+
+    /// <summary>
+    /// فعال‌سازی metrics
+    /// </summary>
+    public bool EnableMetrics { get; set; } = true;
+
+    /// <summary>
+    /// فعال‌سازی health checks
+    /// </summary>
+    public bool EnableHealthChecks { get; set; } = true;
+
+    /// <summary>
+    /// فاصله زمانی health check (ثانیه)
+    /// </summary>
+    public int HealthCheckIntervalSeconds { get; set; } = 300; // 5 minutes
+
+    #endregion
+
     #region Helper Properties
 
     /// <summary>
@@ -74,6 +165,26 @@ public class GardeshgariBankOptions
     /// آیا لاگ‌های تفصیلی فعال است
     /// </summary>
     public bool IsDetailedLoggingEnabled => EnableDetailedLogging;
+
+    /// <summary>
+    /// آیا retry برای Execute امکان‌پذیر است
+    /// </summary>
+    public bool IsExecutionRetryEnabled => MaxExecutionAttempts > 1;
+
+    /// <summary>
+    /// آیا retry برای Inquiry امکان‌پذیر است
+    /// </summary>
+    public bool IsInquiryRetryEnabled => MaxInquiryRetryAttempts > 1;
+
+    /// <summary>
+    /// TimeSpan برای refresh interval استعلام
+    /// </summary>
+    public TimeSpan InquiryRefreshInterval => TimeSpan.FromMinutes(InquiryRefreshIntervalMinutes);
+
+    /// <summary>
+    /// TimeSpan برای cache duration
+    /// </summary>
+    public TimeSpan InquiryCacheDuration => TimeSpan.FromMinutes(InquiryCacheDurationMinutes);
 
     #endregion
 
@@ -91,7 +202,13 @@ public class GardeshgariBankOptions
                MaxExecutionAttempts > 0 &&
                RetryDelayMilliseconds > 0 &&
                MaxWaitForReadyMinutes > 0 &&
-               ReadinessCheckIntervalSeconds > 0;
+               ReadinessCheckIntervalSeconds > 0 &&
+               MaxInquiryRetryAttempts >= 0 &&
+               InquiryRetryDelaySeconds > 0 &&
+               InquiryRefreshIntervalMinutes > 0 &&
+               MaxConcurrentRequests > 0 &&
+               BatchInquirySize > 0 &&
+               MaxResponseSizeBytes > 0;
     }
 
     /// <summary>
@@ -125,7 +242,102 @@ public class GardeshgariBankOptions
         if (ReadinessCheckIntervalSeconds <= 0)
             errors.Add("ReadinessCheckIntervalSeconds باید بزرگتر از صفر باشد");
 
+        if (MaxInquiryRetryAttempts < 0)
+            errors.Add("MaxInquiryRetryAttempts نمی‌تواند منفی باشد");
+
+        if (InquiryRetryDelaySeconds <= 0)
+            errors.Add("InquiryRetryDelaySeconds باید بزرگتر از صفر باشد");
+
+        if (InquiryRefreshIntervalMinutes <= 0)
+            errors.Add("InquiryRefreshIntervalMinutes باید بزرگتر از صفر باشد");
+
+        if (MaxConcurrentRequests <= 0)
+            errors.Add("MaxConcurrentRequests باید بزرگتر از صفر باشد");
+
+        if (BatchInquirySize <= 0)
+            errors.Add("BatchInquirySize باید بزرگتر از صفر باشد");
+
+        if (MaxResponseSizeBytes <= 0)
+            errors.Add("MaxResponseSizeBytes باید بزرگتر از صفر باشد");
+
+        // بررسی محدودیت‌های منطقی
+        if (MaxExecutionAttempts > 10)
+            errors.Add("MaxExecutionAttempts نباید بیشتر از 10 باشد (خطر پرداخت دوبل)");
+
+        if (RetryDelayMilliseconds > 30000)
+            errors.Add("RetryDelayMilliseconds نباید بیشتر از 30 ثانیه باشد");
+
+        if (MaxWaitForReadyMinutes > 120)
+            errors.Add("MaxWaitForReadyMinutes نباید بیشتر از 2 ساعت باشد");
+
+        if (TimeoutSeconds > 600)
+            errors.Add("TimeoutSeconds نباید بیشتر از 10 دقیقه باشد");
+
         return errors;
+    }
+
+    /// <summary>
+    /// آیا کد خطا برای Execute قابل تکرار است
+    /// </summary>
+    public bool IsExecutionErrorRetryable(int? errorCode)
+    {
+        return errorCode.HasValue &&
+               IsExecutionRetryEnabled &&
+               RetryableExecutionErrorCodes.Contains(errorCode.Value);
+    }
+
+    /// <summary>
+    /// آیا کد خطا برای Inquiry قابل تکرار است
+    /// </summary>
+    public bool IsInquiryErrorRetryable(int? errorCode)
+    {
+        return errorCode.HasValue &&
+               IsInquiryRetryEnabled &&
+               RetryableInquiryErrorCodes.Contains(errorCode.Value);
+    }
+
+    #endregion
+
+    #region Environment Specific Configurations
+
+    /// <summary>
+    /// تنظیمات محیط Development
+    /// </summary>
+    public static GardeshgariBankOptions ForDevelopment()
+    {
+        return new GardeshgariBankOptions
+        {
+            BaseApiUrl = "https://test-gsb.TourismBank.ir",
+            AccessTokenUrl = "https://test-sso.TourismBank.ir/oauth/token",
+            TimeoutSeconds = 30,
+            MaxExecutionAttempts = 1, // کم‌تر در dev
+            RetryDelayMilliseconds = 1000,
+            EnableDetailedLogging = true,
+            MaxInquiryRetryAttempts = 1,
+            EnableInquiryCache = false, // بدون cache در dev
+            EnableCertificateValidation = false
+        };
+    }
+
+    /// <summary>
+    /// تنظیمات محیط Production
+    /// </summary>
+    public static GardeshgariBankOptions ForProduction()
+    {
+        return new GardeshgariBankOptions
+        {
+            BaseApiUrl = "https://gsb.TourismBank.ir",
+            AccessTokenUrl = "https://sso.TourismBank.ir/oauth/token",
+            TimeoutSeconds = 120,
+            MaxExecutionAttempts = 3,
+            RetryDelayMilliseconds = 5000,
+            EnableDetailedLogging = false,
+            MaxInquiryRetryAttempts = 3,
+            EnableInquiryCache = true,
+            EnableCertificateValidation = true,
+            EnableMetrics = true,
+            EnableHealthChecks = true
+        };
     }
 
     #endregion

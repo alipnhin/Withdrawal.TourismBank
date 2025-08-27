@@ -1,4 +1,6 @@
 ﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using TPG.SI.SplunkLogger.Utils;
 using TPG.SI.TadbirPay.Infrastructure.Dtos;
 using TPG.SI.TadbirPay.Infrastructure.Dtos.Gateway;
 using TPG.SI.TadbirPay.Infrastructure.Dtos.Payment;
@@ -6,25 +8,29 @@ using TPG.SI.TadbirPay.Infrastructure.Enums;
 using TPG.SI.TadbirPay.Withdrawal.TourismBank.Dtos;
 using TPG.SI.TadbirPay.Withdrawal.TourismBank.Dtos.Payment;
 using TPG.SI.TadbirPay.Withdrawal.TourismBank.Dtos.Response;
+using TPG.SI.TadbirPay.Withdrawal.TourismBank.Mappers;
 using TPG.SI.TadbirPay.Withdrawal.TourismBank.Services;
 
 namespace TPG.SI.TadbirPay.Withdrawal.TourismBank.Workflows;
 
 /// <summary>
-/// مدیریت workflow پرداخت گروهی بانک گردشگری
+/// مدیریت workflow پرداخت گروهی بانک گردشگری - نسخه بازطراحی شده
 /// </summary>
 internal class GardeshgariPaymentWorkflow
 {
     private readonly ILogger<GardeshgariPaymentWorkflow> _logger;
     private readonly IPaymentService _paymentService;
+    private readonly IOptions<GardeshgariBankOptions> _options;
     private readonly string _appModule = "GardeshgariPaymentWorkflow";
 
     public GardeshgariPaymentWorkflow(
         ILogger<GardeshgariPaymentWorkflow> logger,
-        IPaymentService paymentService)
+        IPaymentService paymentService,
+        IOptions<GardeshgariBankOptions> options)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _paymentService = paymentService ?? throw new ArgumentNullException(nameof(paymentService));
+        _options = options ?? throw new ArgumentNullException(nameof(options));
     }
 
     /// <summary>
@@ -38,13 +44,25 @@ internal class GardeshgariPaymentWorkflow
 
         try
         {
-            _logger.LogInformation($"Starting group payment registration for OrderId: {paymentOrder.OrderId}");
+            _logger.LogInformationSplunk(
+                "Starting group payment registration",
+                paymentOrder.OrderId,
+                _appModule,
+                new { TransactionCount = paymentOrder.Transactions.Count }
+            );
 
             // ثبت درخواست پرداخت گروهی در بانک
             var registerResult = await _paymentService.RegisterGroupPaymentAsync(paymentOrder, gatewayInfo);
 
             if (!registerResult.IsSuccess)
             {
+                _logger.LogErrorSplunk(
+                    "Group payment registration failed",
+                    paymentOrder.OrderId,
+                    _appModule,
+                    new { ErrorMessage = registerResult.Message, ErrorCode = registerResult.ErrorCode }
+                );
+
                 response.IsSuccess = false;
                 response.Message = registerResult.Message;
                 return response;
@@ -64,19 +82,35 @@ internal class GardeshgariPaymentWorkflow
             }
 
             // ایجاد metadata اولیه
-            var metadata = new PaymentOrderMetadata();
+            var metadata = new PaymentOrderMetadata
+            {
+                CurrentPhase = PaymentPhase.Registered,
+                LastBankStatus = "GROUP_PAYMENT_REGISTERED_STATE",
+                LastInquiryTime = DateTime.UtcNow
+            };
             paymentOrder.UpdatePaymentMetadata(metadata);
 
             response.Data = paymentOrder;
             response.Message = "ثبت تراکنش گروهی با موفقیت انجام شد";
 
-            _logger.LogInformation($"Group payment registered successfully with TrackingId: {registerResult.TrackingId}");
+            _logger.LogInformationSplunk(
+                "Group payment registered successfully",
+                paymentOrder.OrderId,
+                _appModule,
+                new { TrackingId = registerResult.TrackingId, Phase = metadata.CurrentPhase }
+            );
 
             return response;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"Exception in register payment for OrderId: {paymentOrder.OrderId}");
+            _logger.LogErrorSplunk(
+                "Exception in register payment",
+                paymentOrder.OrderId,
+                _appModule,
+                ex
+            );
+
             response.IsSuccess = false;
             response.HasException = true;
             response.Message = "خطا در ثبت پرداخت گروهی. لطفا بعدا تلاش کنید.";
@@ -85,7 +119,7 @@ internal class GardeshgariPaymentWorkflow
     }
 
     /// <summary>
-    /// استعلام هوشمند پرداخت گروهی
+    /// استعلام هوشمند پرداخت گروهی - لاجیک کاملاً بازطراحی شده
     /// </summary>
     public async Task<ProviderResponseDto<PaymentOrderDto>> InquiryPaymentAsync(
         PaymentOrderDto paymentOrder,
@@ -95,35 +129,54 @@ internal class GardeshgariPaymentWorkflow
 
         try
         {
-            _logger.LogInformation($"Starting smart inquiry for OrderId: {paymentOrder.OrderId}");
+            _logger.LogInformationSplunk(
+                "Starting smart inquiry workflow",
+                paymentOrder.OrderId,
+                _appModule,
+                new { CurrentPhase = paymentOrder.GetCurrentPhase() }
+            );
+
+            // مرحله 1: همیشه وضعیت کلی را از بانک بگیر
+            var readinessResult = await CheckBankStatusAsync(paymentOrder, gatewayInfo);
+            if (!readinessResult.IsSuccess)
+            {
+                return readinessResult;
+            }
 
             var metadata = paymentOrder.GetPaymentMetadata();
 
-            // مرحله 1: اگر هنوز Execute نشده، ابتدا وضعیت آمادگی را بررسی کن
-            if (metadata.NeedsExecution())
+            // مرحله 2: تصمیم‌گیری بر اساس وضعیت بانک
+            var bankStatus = metadata.LastBankStatus?.ToUpper();
+
+            _logger.LogInformationSplunk(
+                "Bank status determined",
+                paymentOrder.OrderId,
+                _appModule,
+                new { BankStatus = bankStatus, CurrentPhase = metadata.CurrentPhase }
+            );
+
+            return bankStatus switch
             {
-                var readinessResult = await CheckExecutionReadinessAsync(paymentOrder, gatewayInfo, metadata);
-                if (!readinessResult.IsSuccess)
-                {
-                    return readinessResult;
-                }
-            }
-
-            // مرحله 2: استعلام نهایی از سرویس مناسب
-            var finalInquiryResult = await PerformFinalInquiryAsync(paymentOrder, gatewayInfo, metadata);
-            if (!finalInquiryResult.IsSuccess)
-            {
-                return finalInquiryResult;
-            }
-
-            response.Data = paymentOrder;
-            response.Message = "استعلام پرداخت گروهی با موفقیت انجام شد";
-
-            return response;
+                "READY" => await HandleReadyStateAsync(paymentOrder, gatewayInfo),
+                "DONE" => await HandleCompletedStateAsync(paymentOrder, gatewayInfo),
+                "GROUP_PAYMENT_ERROR_STATE" or "FAILED" or "FAIL" =>
+                    HandleErrorState(paymentOrder, readinessResult.ErrorMessage ?? "خطای نامشخص بانک"),
+                "CANCELED" or "CANCELLED" =>
+                    HandleCanceledState(paymentOrder),
+                "EXPIRED" =>
+                    HandleExpiredState(paymentOrder),
+                _ => HandlePendingState(paymentOrder, bankStatus)
+            };
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, $"Exception in inquiry payment for OrderId: {paymentOrder.OrderId}");
+            _logger.LogErrorSplunk(
+                "Exception in smart inquiry workflow",
+                paymentOrder.OrderId,
+                _appModule,
+                ex
+            );
+
             response.IsSuccess = false;
             response.HasException = true;
             response.Message = "خطا در استعلام پرداخت گروهی. لطفا بعدا تلاش کنید.";
@@ -132,210 +185,431 @@ internal class GardeshgariPaymentWorkflow
     }
 
     /// <summary>
-    /// بررسی آمادگی برای اجرا و اجرای DoPayment در صورت لزوم - بروزرسانی شده
+    /// بررسی وضعیت کلی از بانک و به‌روزرسانی metadata
     /// </summary>
-    private async Task<ProviderResponseDto<PaymentOrderDto>> CheckExecutionReadinessAsync(
+    private async Task<ProviderResponseDto<PaymentOrderDto>> CheckBankStatusAsync(
         PaymentOrderDto paymentOrder,
-        GatewayInfoDto gatewayInfo,
-        PaymentOrderMetadata metadata)
+        GatewayInfoDto gatewayInfo)
     {
-        _logger.LogInformation($"Checking execution readiness for OrderId: {paymentOrder.OrderId}");
+        _logger.LogInformationSplunk(
+            "Checking bank status",
+            paymentOrder.OrderId,
+            _appModule
+        );
 
         // استعلام آمادگی از API اول
-        var readinessResult = await _paymentService.CheckExecutionReadinessAsync(paymentOrder.TrackingId, gatewayInfo);
+        var readinessResult = await _paymentService.CheckExecutionReadinessAsync(
+            paymentOrder.TrackingId,
+            gatewayInfo);
 
         if (!readinessResult.IsSuccess)
         {
-            _logger.LogWarning($"Readiness inquiry failed for OrderId: {paymentOrder.OrderId}. Message: {readinessResult.Message}");
+            _logger.LogWarning(
+            "Bank status check failed",
+            paymentOrder.OrderId,
+            _appModule,
+            new { ErrorMessage = readinessResult.Message, ErrorCode = readinessResult.ErrorCode }
+        );
+
             return new ProviderResponseDto<PaymentOrderDto>
             {
                 IsSuccess = false,
-                Message = $"خطا در بررسی آمادگی: {readinessResult.Message}",
+                Message = $"خطا در دریافت وضعیت از بانک: {readinessResult.Message}",
                 Data = paymentOrder
             };
         }
 
-        // به‌روزرسانی وضعیت در metadata
-        metadata.UpdateInquiryStatus(readinessResult.TransactionStatus);
-        paymentOrder.UpdatePaymentMetadata(metadata);
+        // به‌روزرسانی metadata بر اساس وضعیت دریافت شده از بانک
+        paymentOrder.UpdateFromBankStatus(readinessResult.TransactionStatus);
 
-        _logger.LogInformation($"Current status for OrderId: {paymentOrder.OrderId} is: {readinessResult.TransactionStatus}");
+        // به‌روزرسانی وضعیت کلی سفارش
+        paymentOrder.Status = BankStatusMapper.MapOrderStatus(readinessResult.TransactionStatus);
 
-        // اگر Ready است، DoPayment را اجرا کن
-        if (readinessResult.IsReadyForExecution)
-        {
-            return await ExecutePaymentAsync(paymentOrder, gatewayInfo, metadata);
-        }
-
-        // اگر خطا دارد
-        if (readinessResult.IsFailed)
-        {
-            paymentOrder.Status = PaymentStatusEnum.BankRejected;
-            var errorMessages = string.Join(", ", readinessResult.RecordErrors.Select(e => e.Description));
-            return new ProviderResponseDto<PaymentOrderDto>
+        _logger.LogInformationSplunk(
+            "Bank status updated",
+            paymentOrder.OrderId,
+            _appModule,
+            new
             {
-                IsSuccess = false,
-                Message = $"درخواست پرداخت ناموفق: {errorMessages}",
-                Data = paymentOrder
-            };
-        }
-
-        // اگر هنوز Ready نیست، وضعیت کلی را بر اساس پاسخ تنظیم کن
-        UpdateOrderStatusBasedOnReadiness(paymentOrder, readinessResult.TransactionStatus);
+                BankStatus = readinessResult.TransactionStatus,
+                OrderStatus = paymentOrder.Status,
+                IsReady = readinessResult.IsReadyForExecution
+            }
+        );
 
         return new ProviderResponseDto<PaymentOrderDto>
         {
             IsSuccess = true,
-            Message = $"وضعیت فعلی: {GetStatusDescription(readinessResult.TransactionStatus)}",
+            Data = paymentOrder,
+            Message = readinessResult.Message
+        };
+    }
+
+    /// <summary>
+    /// مدیریت حالت READY - اجرای DoPayment
+    /// </summary>
+    private async Task<ProviderResponseDto<PaymentOrderDto>> HandleReadyStateAsync(
+        PaymentOrderDto paymentOrder,
+        GatewayInfoDto gatewayInfo)
+    {
+        _logger.LogInformationSplunk(
+            "Handling READY state",
+            paymentOrder.OrderId,
+            _appModule,
+            new { CanRetry = paymentOrder.CanRetryExecution() }
+        );
+
+        // اگر DoPayment قبلاً اجرا شده، به استعلام تفصیلی برو
+        if (paymentOrder.IsDoPaymentCompleted())
+        {
+            return await PerformDetailedInquiryAsync(paymentOrder, gatewayInfo);
+        }
+
+        // اگر امکان retry وجود دارد، DoPayment را اجرا کن
+        if (paymentOrder.CanRetryExecution())
+        {
+            return await ExecutePaymentAsync(paymentOrder, gatewayInfo);
+        }
+
+        // در غیر این صورت، آخرین خطا را گزارش کن
+        var metadata = paymentOrder.GetPaymentMetadata();
+        return new ProviderResponseDto<PaymentOrderDto>
+        {
+            IsSuccess = false,
+            Message = $"حداکثر تعداد تلاش برای اجرا انجام شده: {metadata.LastExecutionError}",
             Data = paymentOrder
         };
     }
 
     /// <summary>
-    /// اجرای DoPayment
+    /// مدیریت حالت DONE - استعلام تفصیلی
+    /// </summary>
+    private async Task<ProviderResponseDto<PaymentOrderDto>> HandleCompletedStateAsync(
+        PaymentOrderDto paymentOrder,
+        GatewayInfoDto gatewayInfo)
+    {
+        _logger.LogInformationSplunk(
+            "Handling DONE state - performing detailed inquiry",
+            paymentOrder.OrderId,
+            _appModule
+        );
+
+        return await PerformDetailedInquiryAsync(paymentOrder, gatewayInfo);
+    }
+
+    /// <summary>
+    /// مدیریت حالت خطا
+    /// </summary>
+    private ProviderResponseDto<PaymentOrderDto> HandleErrorState(
+        PaymentOrderDto paymentOrder,
+        string errorMessage)
+    {
+        _logger.LogErrorSplunk(
+            "Payment is in error state",
+            paymentOrder.OrderId,
+            _appModule,
+            new { ErrorMessage = errorMessage }
+        );
+
+        paymentOrder.Status = PaymentStatusEnum.BankRejected;
+        paymentOrder.MarkPhaseCompleted(PaymentPhase.Failed);
+
+        // تنظیم وضعیت همه تراکنش‌ها روی خطا
+        foreach (var transaction in paymentOrder.Transactions)
+        {
+            if (transaction.Status == PaymentItemStatusEnum.WaitForExecution ||
+                transaction.Status == PaymentItemStatusEnum.WaitForBank)
+            {
+                transaction.Status = PaymentItemStatusEnum.BankRejected;
+                transaction.ProviderMessage = errorMessage;
+            }
+        }
+
+        return new ProviderResponseDto<PaymentOrderDto>
+        {
+            IsSuccess = false,
+            Message = $"پرداخت توسط بانک رد شده: {errorMessage}",
+            Data = paymentOrder
+        };
+    }
+
+    /// <summary>
+    /// مدیریت حالت لغو
+    /// </summary>
+    private ProviderResponseDto<PaymentOrderDto> HandleCanceledState(PaymentOrderDto paymentOrder)
+    {
+        _logger.LogInformationSplunk(
+            "Payment is canceled",
+            paymentOrder.OrderId,
+            _appModule
+        );
+
+        paymentOrder.Status = PaymentStatusEnum.Canceled;
+        paymentOrder.MarkPhaseCompleted(PaymentPhase.Failed);
+
+        foreach (var transaction in paymentOrder.Transactions)
+        {
+            if (transaction.Status != PaymentItemStatusEnum.BankSucceeded)
+            {
+                transaction.Status = PaymentItemStatusEnum.Canceled;
+            }
+        }
+
+        return new ProviderResponseDto<PaymentOrderDto>
+        {
+            IsSuccess = true,
+            Message = "پرداخت لغو شده است",
+            Data = paymentOrder
+        };
+    }
+
+    /// <summary>
+    /// مدیریت حالت منقضی
+    /// </summary>
+    private ProviderResponseDto<PaymentOrderDto> HandleExpiredState(PaymentOrderDto paymentOrder)
+    {
+        _logger.LogInformationSplunk(
+            "Payment is expired",
+            paymentOrder.OrderId,
+            _appModule
+        );
+
+        paymentOrder.Status = PaymentStatusEnum.Expired;
+        paymentOrder.MarkPhaseCompleted(PaymentPhase.Failed);
+
+        foreach (var transaction in paymentOrder.Transactions)
+        {
+            if (transaction.Status != PaymentItemStatusEnum.BankSucceeded)
+            {
+                transaction.Status = PaymentItemStatusEnum.Expired;
+            }
+        }
+
+        return new ProviderResponseDto<PaymentOrderDto>
+        {
+            IsSuccess = true,
+            Message = "پرداخت منقضی شده است",
+            Data = paymentOrder
+        };
+    }
+
+    /// <summary>
+    /// مدیریت حالت‌های در حال پردازش
+    /// </summary>
+    private ProviderResponseDto<PaymentOrderDto> HandlePendingState(
+        PaymentOrderDto paymentOrder,
+        string bankStatus)
+    {
+        _logger.LogInformationSplunk(
+            "Payment is still processing",
+            paymentOrder.OrderId,
+            _appModule,
+            new { BankStatus = bankStatus }
+        );
+
+        paymentOrder.Status = PaymentStatusEnum.SubmittedToBank;
+
+        var statusDescription = BankStatusMapper.GetStatusDescription(bankStatus);
+
+        return new ProviderResponseDto<PaymentOrderDto>
+        {
+            IsSuccess = true,
+            Message = $"وضعیت فعلی: {statusDescription}",
+            Data = paymentOrder
+        };
+    }
+
+    /// <summary>
+    /// اجرای DoPayment با retry logic
     /// </summary>
     private async Task<ProviderResponseDto<PaymentOrderDto>> ExecutePaymentAsync(
         PaymentOrderDto paymentOrder,
-        GatewayInfoDto gatewayInfo,
-        PaymentOrderMetadata metadata)
+        GatewayInfoDto gatewayInfo)
     {
-        _logger.LogInformation($"Executing DoPayment for OrderId: {paymentOrder.OrderId}");
+        _logger.LogInformationSplunk(
+            "Executing DoPayment",
+            paymentOrder.OrderId,
+            _appModule,
+            new { Attempt = paymentOrder.GetPaymentMetadata().ExecutionAttempts + 1 }
+        );
 
         // علامت‌گذاری شروع اجرا
         paymentOrder.MarkExecutionStarted();
 
-        // اجرای DoPayment
-        var executeResult = await _paymentService.ExecuteGroupPaymentAsync(paymentOrder.TrackingId, gatewayInfo);
-
-        if (!executeResult.IsSuccess)
+        try
         {
-            _logger.LogError($"DoPayment failed for OrderId: {paymentOrder.OrderId}. Message: {executeResult.Message}");
+            // اجرای DoPayment
+            var executeResult = await _paymentService.ExecuteGroupPaymentAsync(
+                paymentOrder.TrackingId,
+                gatewayInfo);
 
-            paymentOrder.MarkExecutionFailed(executeResult.Message);
-            paymentOrder.Status = PaymentStatusEnum.BankRejected;
-
-            return new ProviderResponseDto<PaymentOrderDto>
+            if (!executeResult.IsSuccess)
             {
-                IsSuccess = false,
-                Message = $"خطا در اجرای پرداخت: {executeResult.Message}",
-                Data = paymentOrder
-            };
-        }
+                _logger.LogErrorSplunk(
+                    "DoPayment execution failed",
+                    paymentOrder.OrderId,
+                    _appModule,
+                    new { ErrorMessage = executeResult.Message, RsCode = executeResult.RsCode }
+                );
 
-        // علامت‌گذاری تکمیل موفق اجرا
-        paymentOrder.MarkExecutionCompleted();
-        paymentOrder.Status = PaymentStatusEnum.SubmittedToBank;
+                paymentOrder.MarkExecutionFailed(executeResult.Message);
 
-        // تغییر وضعیت تراکنش‌ها
-        foreach (var transaction in paymentOrder.Transactions)
-        {
-            transaction.Status = PaymentItemStatusEnum.WaitForBank;
-        }
+                // بررسی امکان retry
+                if (paymentOrder.CanRetryExecution() && IsRetryableError(executeResult.RsCode))
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(_options.Value.RetryDelayMilliseconds / 1000));
+                    return await ExecutePaymentAsync(paymentOrder, gatewayInfo);
+                }
 
-        _logger.LogInformation($"DoPayment executed successfully for OrderId: {paymentOrder.OrderId}");
+                paymentOrder.Status = PaymentStatusEnum.BankRejected;
+                return new ProviderResponseDto<PaymentOrderDto>
+                {
+                    IsSuccess = false,
+                    Message = $"خطا در اجرای پرداخت: {executeResult.Message}",
+                    Data = paymentOrder
+                };
+            }
 
-        return new ProviderResponseDto<PaymentOrderDto>
-        {
-            IsSuccess = true,
-            Message = "اجرای پرداخت با موفقیت انجام شد",
-            Data = paymentOrder
-        };
-    }
+            // علامت‌گذاری تکمیل موفق اجرا
+            paymentOrder.MarkExecutionCompleted();
+            paymentOrder.Status = PaymentStatusEnum.SubmittedToBank;
 
-    /// <summary>
-    /// استعلام نهایی از سرویس مناسب
-    /// </summary>
-    private async Task<ProviderResponseDto<PaymentOrderDto>> PerformFinalInquiryAsync(
-       PaymentOrderDto paymentOrder,
-       GatewayInfoDto gatewayInfo,
-       PaymentOrderMetadata metadata)
-    {
-        _logger.LogInformation($"Performing final inquiry for OrderId: {paymentOrder.OrderId}");
-
-        // ایجاد درخواست استعلام تفصیلی
-        var request = new TransactionInquiryRequest
-        {
-            TransactionId = paymentOrder.TrackingId,
-            FirstIndex = paymentOrder.Transactions.Min(t => t.RowNumber),
-            LastIndex = paymentOrder.Transactions.Max(t => t.RowNumber)
-        };
-
-        _logger.LogInformation($"Using TransactionInquiry API for OrderId: {paymentOrder.OrderId}");
-
-        var inquiryResult = await _paymentService.InquiryTransactionDetailsAsync(request, gatewayInfo);
-
-        if (!inquiryResult.IsSuccess)
-        {
-            return new ProviderResponseDto<PaymentOrderDto>
-            {
-                IsSuccess = false,
-                Message = inquiryResult.Message,
-                Data = paymentOrder
-            };
-        }
-
-        // به‌روزرسانی وضعیت‌ها بر اساس نتیجه استعلام
-        UpdateStatusesFromDetailedInquiry(paymentOrder, inquiryResult);
-
-        return new ProviderResponseDto<PaymentOrderDto>
-        {
-            IsSuccess = true,
-            Message = "استعلام با موفقیت انجام شد",
-            Data = paymentOrder
-        };
-    }
-
-    /// <summary>
-    /// آیا آماده اجرا است
-    /// </summary>
-    private static bool IsReadyForExecution(string status)
-    {
-        return status?.ToUpper() == "READY";
-    }
-
-    /// <summary>
-    /// به‌روزرسانی وضعیت سفارش بر اساس آمادگی
-    /// </summary>
-    private static void UpdateOrderStatusBasedOnReadiness(PaymentOrderDto paymentOrder, string status)
-    {
-        paymentOrder.Status = status?.ToUpper() switch
-        {
-            "PROCESSING" => PaymentStatusEnum.SubmittedToBank,
-            "FAILED" => PaymentStatusEnum.BankRejected,
-            "GROUP_PAYMENT_ERROR_STATE" => PaymentStatusEnum.BankRejected,
-            _ => PaymentStatusEnum.SubmittedToBank
-        };
-    }
-
-    /// <summary>
-    /// به‌روزرسانی وضعیت‌ها بر اساس نتیجه استعلام
-    /// </summary>
-    private static void UpdateStatusesFromInquiry(PaymentOrderDto paymentOrder, InquiryResult inquiryResult)
-    {
-        // به‌روزرسانی وضعیت کلی سفارش
-        paymentOrder.Status = inquiryResult.MapOrderStatus();
-        paymentOrder.UpdateInquiryStatus(inquiryResult.Status);
-
-        // به‌روزرسانی وضعیت تراکنش‌ها
-        if (inquiryResult.Transactions != null)
-        {
+            // تغییر وضعیت تراکنش‌ها
             foreach (var transaction in paymentOrder.Transactions)
             {
-                var bankTransaction = inquiryResult.FindTransaction(transaction.RowNumber);
-                if (bankTransaction != null)
+                if (transaction.Status == PaymentItemStatusEnum.WaitForExecution)
                 {
-                    transaction.Status = inquiryResult.MapTransactionStatus(bankTransaction.Status);
-                    transaction.ProviderMessage = bankTransaction.ErrorDescription;
+                    transaction.Status = PaymentItemStatusEnum.WaitForBank;
                 }
             }
+
+            _logger.LogInformationSplunk(
+                "DoPayment executed successfully",
+                paymentOrder.OrderId,
+                _appModule
+            );
+
+            // بعد از اجرای موفق DoPayment، کمی صبر کن و استعلام تفصیلی انجام بده
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            return await PerformDetailedInquiryAsync(paymentOrder, gatewayInfo);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogErrorSplunk(
+                "Exception during DoPayment execution",
+                paymentOrder.OrderId,
+                _appModule,
+                ex
+            );
+
+            paymentOrder.MarkExecutionFailed($"خطای سیستمی: {ex.Message}");
+            paymentOrder.Status = PaymentStatusEnum.SystemError;
+
+            return new ProviderResponseDto<PaymentOrderDto>
+            {
+                IsSuccess = false,
+                HasException = true,
+                Message = "خطای سیستمی در اجرای پرداخت. لطفا بعدا تلاش کنید.",
+                Data = paymentOrder
+            };
         }
     }
 
+    /// <summary>
+    /// استعلام تفصیلی از تراکنش‌ها
+    /// </summary>
+    private async Task<ProviderResponseDto<PaymentOrderDto>> PerformDetailedInquiryAsync(
+        PaymentOrderDto paymentOrder,
+        GatewayInfoDto gatewayInfo)
+    {
+        _logger.LogInformationSplunk(
+            "Performing detailed inquiry",
+            paymentOrder.OrderId,
+            _appModule
+        );
+
+        try
+        {
+            // ایجاد درخواست استعلام تفصیلی برای همه تراکنش‌ها
+            var request = new TransactionInquiryRequest
+            {
+                TransactionId = paymentOrder.TrackingId,
+                FirstIndex = paymentOrder.Transactions.Min(t => t.RowNumber),
+                LastIndex = paymentOrder.Transactions.Max(t => t.RowNumber)
+            };
+
+            var inquiryResult = await _paymentService.InquiryTransactionDetailsAsync(request, gatewayInfo);
+
+            if (!inquiryResult.IsSuccess)
+            {
+                _logger.LogWarningSplunk(
+                    "Detailed inquiry failed",
+                    paymentOrder.OrderId,
+                    _appModule,
+                    new { ErrorMessage = inquiryResult.Message }
+                );
+
+                return new ProviderResponseDto<PaymentOrderDto>
+                {
+                    IsSuccess = false,
+                    Message = $"خطا در استعلام تفصیلی: {inquiryResult.Message}",
+                    Data = paymentOrder
+                };
+            }
+
+            // به‌روزرسانی وضعیت‌ها بر اساس نتیجه استعلام
+            UpdateStatusesFromDetailedInquiry(paymentOrder, inquiryResult);
+
+            // به‌روزرسانی metadata
+            paymentOrder.UpdateTransactionStatuses(inquiryResult);
+            paymentOrder.MarkPhaseCompleted(PaymentPhase.Completed);
+
+            _logger.LogInformationSplunk(
+                "Detailed inquiry completed successfully",
+                paymentOrder.OrderId,
+                _appModule,
+                new
+                {
+                    OrderStatus = paymentOrder.Status,
+                    CompletedTransactions = inquiryResult.Transactions.Count(t =>
+                        BankStatusMapper.IsSuccessStatus(t.Status)),
+                    FailedTransactions = inquiryResult.Transactions.Count(t =>
+                        BankStatusMapper.IsErrorStatus(t.Status))
+                }
+            );
+
+            return new ProviderResponseDto<PaymentOrderDto>
+            {
+                IsSuccess = true,
+                Message = "استعلام تفصیلی با موفقیت انجام شد",
+                Data = paymentOrder
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogErrorSplunk(
+                "Exception during detailed inquiry",
+                paymentOrder.OrderId,
+                _appModule,
+                ex
+            );
+
+            return new ProviderResponseDto<PaymentOrderDto>
+            {
+                IsSuccess = false,
+                HasException = true,
+                Message = "خطای سیستمی در استعلام تفصیلی. لطفا بعدا تلاش کنید.",
+                Data = paymentOrder
+            };
+        }
+    }
 
     /// <summary>
     /// به‌روزرسانی وضعیت‌ها بر اساس نتیجه استعلام تفصیلی
     /// </summary>
-    private static void UpdateStatusesFromDetailedInquiry(PaymentOrderDto paymentOrder, TransactionInquiryResult inquiryResult)
+    private static void UpdateStatusesFromDetailedInquiry(
+        PaymentOrderDto paymentOrder,
+        TransactionInquiryResult inquiryResult)
     {
         // به‌روزرسانی وضعیت تراکنش‌ها
         foreach (var transaction in paymentOrder.Transactions)
@@ -345,47 +619,30 @@ internal class GardeshgariPaymentWorkflow
             {
                 transaction.Status = bankTransaction.MapToStandardStatus();
                 transaction.ProviderMessage = bankTransaction.ErrorDescription;
+
+                // اگر تراکنش موفق بوده، reference number را ذخیره کن
+                if (transaction.Status == PaymentItemStatusEnum.BankSucceeded)
+                {
+                    transaction.TrackingId = bankTransaction.RefrenceNumber ?? transaction.TrackingId;
+                }
             }
         }
 
         // تعیین وضعیت کلی بر اساس وضعیت تراکنش‌ها
-        var transactionStatuses = paymentOrder.Transactions.Select(t => t.Status).Distinct().ToList();
-
-        if (transactionStatuses.All(s => s == PaymentItemStatusEnum.BankSucceeded))
-        {
-            paymentOrder.Status = PaymentStatusEnum.BankSucceeded;
-        }
-        else if (transactionStatuses.Any(s => s == PaymentItemStatusEnum.BankSucceeded))
-        {
-            paymentOrder.Status = PaymentStatusEnum.DoneWithError;
-        }
-        else if (transactionStatuses.All(s => s == PaymentItemStatusEnum.BankRejected))
-        {
-            paymentOrder.Status = PaymentStatusEnum.BankRejected;
-        }
-        else
-        {
-            paymentOrder.Status = PaymentStatusEnum.SubmittedToBank;
-        }
+        var transactionStatuses = paymentOrder.Transactions.Select(t => t.Status).ToList();
+        paymentOrder.Status = BankStatusMapper.DetermineOrderStatusFromTransactions(transactionStatuses);
     }
 
     /// <summary>
-    /// توضیح وضعیت
+    /// آیا خطا قابل تکرار است
     /// </summary>
-    private static string GetStatusDescription(string status)
+    private static bool IsRetryableError(int? errorCode)
     {
-        return status?.ToUpper() switch
-        {
-            "PROCESSING" => "در حال پردازش",
-            "READY" => "آماده اجرا",
-            "FAILED" => "ناموفق",
-            "GROUP_PAYMENT_WAITING_STATE" => "در انتظار",
-            "GROUP_PAYMENT_REGISTERED_STATE" => "ثبت شده",
-            "GROUP_PAYMENT_UPLOADING_STATE" => "در حال آپلود",
-            "GROUP_PAYMENT_ERROR_STATE" => "خطا در پردازش",
-            _ => status ?? "نامشخص"
-        };
+        if (!errorCode.HasValue)
+            return false;
+
+        // خطاهای قابل تکرار (timeout, connection issues)
+        var retryableErrors = new[] { 408, 500, 502, 503, 504 };
+        return retryableErrors.Contains(errorCode.Value);
     }
 }
-
-
