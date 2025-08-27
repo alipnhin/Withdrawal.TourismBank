@@ -1,0 +1,13 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\..\TPG.SI.TadbirPay.Infrastructure\TPG.SI.TadbirPay.Infrastructure.csproj" />
+		<ProjectReference Include="..\TPG.SI.TadbirPay.Withdrawal\TPG.SI.TadbirPay.Withdrawal.csproj" />
+	</ItemGroup>
+</Project>
